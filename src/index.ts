@@ -59,10 +59,19 @@ const BROWSER_DATA_DIR =
 /**
  * Get or create browser context instance.
  */
+// Headless by default now that cookie import handles the common login case -
+// a headed browser sitting open for the life of the server was pure idle
+// memory once auth stopped requiring a visible window every time. Amazon
+// still occasionally forces a fresh password/passkey confirmation
+// (openid.pape.max_auth_age=0 on order-history pages) that a headless
+// browser has nowhere to render - when that happens, set
+// AMAZON_ORDERS_HEADFUL=1 for one run to get a visible window back.
+const HEADLESS = process.env.AMAZON_ORDERS_HEADFUL !== "1";
+
 async function getBrowserContext(): Promise<BrowserContext> {
   if (!browserContext) {
     const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
-      headless: false, // Need visible browser for login
+      headless: HEADLESS,
       viewport: { width: 1280, height: 800 },
       userAgent:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
