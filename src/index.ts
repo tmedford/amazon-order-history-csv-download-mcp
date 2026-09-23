@@ -18,6 +18,7 @@ import { chromium, BrowserContext, Page } from "playwright";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
 import packageMetadata from "../package.json";
+import { importAmazonCookiesFromChrome } from "./core/cookie-import";
 
 import { AmazonPlugin } from "./amazon/adapter";
 import { getRegionByCode, getRegionCodes } from "./amazon/regions";
@@ -76,6 +77,44 @@ async function getBrowserContext(): Promise<BrowserContext> {
         page = null;
       }
     });
+
+    // This profile has never logged in before - try to import an
+    // already-authenticated amazon.com session from the local Chrome before
+    // falling back to a manual login. Only runs when there is no real
+    // authenticated session yet: an existing AUTH cookie (from a prior
+    // manual login or a prior import) always wins, so this never overwrites
+    // a live session.
+    //
+    // Checking for merely *any* amazon.com cookie is not enough - a plain
+    // unauthenticated visit (e.g. check_amazon_auth_status navigating to
+    // amazon.com to check login state) leaves anonymous cookies like
+    // session-id/ubid-main/lc-main behind, and since this profile persists
+    // on disk across restarts, that false positive would permanently block
+    // cookie import for this profile from then on. at-main/sess-at-main are
+    // Amazon's actual signed-in session cookies.
+    const existingCookies = await context.cookies();
+    const AUTH_COOKIE_NAMES = ["at-main", "sess-at-main"];
+    const hasAmazonSession = existingCookies.some(
+      (c) => c.domain.includes("amazon.com") && AUTH_COOKIE_NAMES.includes(c.name)
+    );
+    if (!hasAmazonSession) {
+      try {
+        const imported = importAmazonCookiesFromChrome();
+        if (imported.length > 0) {
+          await context.addCookies(imported);
+          console.error(
+            `[browser] Imported ${imported.length} amazon.com cookies from Chrome - skipping manual login.`
+          );
+        }
+      } catch (e) {
+        // Import is best-effort. Any failure here (Chrome not installed, no
+        // Keychain entry, decryption error) just means the caller falls
+        // back to the existing manual-login flow - never blocks startup.
+        console.error(
+          `[browser] Cookie import skipped: ${e instanceof Error ? e.message : "unknown error"}`
+        );
+      }
+    }
   }
   return browserContext;
 }
