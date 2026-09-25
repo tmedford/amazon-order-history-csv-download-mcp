@@ -202,6 +202,16 @@ async function openBrowserContext(): Promise<BrowserContext> {
         await browser.close();
       } catch (e) {
         lastError = e; // stale DevToolsActivePort or the owner is still starting
+        // A DevToolsActivePort left by a crashed run + a reused pid would keep the lock
+        // looking alive forever. The endpoint not answering past the grace period is the
+        // real test: take the lock over.
+        if (owner!.ageMs > LOCK_GRACE_MS) {
+          try {
+            unlinkSync(LOCK_FILE);
+          } catch {
+            /* someone else already cleaned it */
+          }
+        }
       }
     }
     if (tryAcquireLock()) {
