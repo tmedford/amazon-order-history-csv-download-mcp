@@ -33,8 +33,12 @@ export function toCSV<T extends Record<string, unknown>>(
 ): string {
   const { includeHeader = true, includeBOM = true } = options;
   
-  // An empty export still gets its header row: a zero-byte file reads as a failed
-  // export, while a header-only file says "ran, found nothing".
+  // With no rows and no columns there is no header to write.
+  if (data.length === 0 && !columns) {
+    return '';
+  }
+  // Otherwise an empty export still gets its header row: a zero-byte file reads as a
+  // failed export, while a header-only file says "ran, found nothing".
   // Determine columns
   const cols = columns || (Object.keys(data[0]) as (keyof T)[]);
   

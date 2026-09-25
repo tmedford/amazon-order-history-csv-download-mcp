@@ -38,7 +38,7 @@ import {
   downloadAmazonInvoice,
   isValidAmazonOrderId,
 } from "./tools";
-import { extractTransactionsFromPage } from "./amazon/extractors/transactions-page";
+import { walkTransactionsPage } from "./amazon/extractors/transactions-page";
 import { openLeanPage } from "./core/browser/lean-pages";
 import {
   extractGiftCardData,
@@ -369,6 +369,9 @@ async function getPage(): Promise<Page> {
   }
 }
 
+const TRUNCATED_WARNING =
+  "Partial: hit the max_scrolls page cap before reaching start_date (or the end of history), so older charges were not read. Raise max_scrolls.";
+
 /**
  * Walk the payments page on a lean page (HTML only - see core/browser/lean-pages.ts).
  * Dates are YYYY-MM-DD and BOTH ends are inclusive: charges are stamped at local
@@ -387,7 +390,7 @@ async function scrapeTransactions(
   const context = await getBrowserContext();
   const lean = await openLeanPage(context);
   try {
-    return await extractTransactionsFromPage(lean, region, {
+    return await walkTransactionsPage(lean, region, {
       startDate: opts.startDate
         ? new Date(`${opts.startDate}T00:00:00Z`)
         : undefined,
@@ -1548,13 +1551,12 @@ async function runTool(request: any): Promise<any> {
 
         // Read the payments page. Amazon no longer lists charges on order-detail pages,
         // which is where this tool used to look - so it "succeeded" with 0 rows every time.
-        const transactions = (
-          await scrapeTransactions(region, {
-            startDate: startDate ?? (year ? `${year}-01-01` : undefined),
-            endDate: endDate ?? (year ? `${year}-12-31` : undefined),
-            maxScrolls: args?.max_scrolls as number | undefined,
-          })
-        ).slice(0, maxOrders ?? undefined);
+        const walk = await scrapeTransactions(region, {
+          startDate: startDate ?? (year ? `${year}-01-01` : undefined),
+          endDate: endDate ?? (year ? `${year}-12-31` : undefined),
+          maxScrolls: args?.max_scrolls as number | undefined,
+        });
+        const transactions = walk.transactions.slice(0, maxOrders ?? undefined);
 
         const exportResult = await exportTransactionsCSV(
           transactions,
@@ -1579,12 +1581,14 @@ async function runTool(request: any): Promise<any> {
                   filePath: exportResult.filePath,
                   rowCount: exportResult.rowCount,
                   error: exportResult.error,
-                  ...(exportResult.rowCount === 0
-                    ? {
-                        warning:
-                          "No charges in this window. If that is unexpected, widen max_scrolls - the payments page is walked newest-first.",
-                      }
-                    : {}),
+                  ...(walk.truncated
+                    ? { warning: TRUNCATED_WARNING }
+                    : exportResult.rowCount === 0
+                      ? {
+                          warning:
+                            "No charges in this window. If that is unexpected, widen max_scrolls - the payments page is walked newest-first.",
+                        }
+                      : {}),
                 },
                 null,
                 2,
@@ -1605,7 +1609,7 @@ async function runTool(request: any): Promise<any> {
         const endDate = args?.end_date as string | undefined;
         const maxScrolls = args?.max_scrolls as number | undefined;
 
-        const transactions = await scrapeTransactions(region, {
+        const { transactions, truncated } = await scrapeTransactions(region, {
           startDate,
           endDate,
           maxScrolls,
@@ -1628,6 +1632,7 @@ async function runTool(request: any): Promise<any> {
                     maxScrolls,
                   },
                   transactionCount: transactions.length,
+                  ...(truncated ? { warning: TRUNCATED_WARNING } : {}),
                   transactions: transactions.map((t) => ({
                     date: t.date.toISOString(),
                     orderIds: t.orderIds,

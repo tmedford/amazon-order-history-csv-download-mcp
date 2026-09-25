@@ -64,11 +64,32 @@ export function getTransactionsPageUrl(region: string): string {
   return `https://www.${domain}/cpe/yourpayments/transactions`;
 }
 
+/** Transactions plus whether the walk covered the whole requested window. */
+export interface TransactionsWalk {
+  transactions: Transaction[];
+  /**
+   * True when the walk hit the page cap (maxScrolls) before reaching startDate (or
+   * the end of history): older rows in the window were never read.
+   */
+  truncated: boolean;
+}
+
 /**
  * Extract all transactions from the transactions page.
  * Uses page navigation for APX layouts and scrolling for legacy layouts.
  */
 export async function extractTransactionsFromPage(
+  page: Page,
+  region: string,
+  options?: Parameters<typeof walkTransactionsPage>[2],
+): Promise<Transaction[]> {
+  return (await walkTransactionsPage(page, region, options)).transactions;
+}
+
+/**
+ * As extractTransactionsFromPage, but also reports whether the window was cut short.
+ */
+export async function walkTransactionsPage(
   page: Page,
   region: string,
   options?: {
@@ -77,7 +98,7 @@ export async function extractTransactionsFromPage(
     maxScrolls?: number;
     onProgress?: (message: string, count: number) => void;
   },
-): Promise<Transaction[]> {
+): Promise<TransactionsWalk> {
   const regionConfig = getRegionByCode(region);
   const currency = regionConfig?.currency || "USD";
   const url = getTransactionsPageUrl(region);
@@ -104,6 +125,8 @@ export async function extractTransactionsFromPage(
   // appended as-is: two identical charges (same day, order and amount - e.g. a refund
   // issued twice) are two real rows. Only the legacy infinite scroll re-shows rows.
   let mode: "first" | "page" | "scroll" = "first";
+  // Set when the loop ends for a reason other than the page cap.
+  let finished = false;
 
   // The transactions page is paginated (Previous/Next page buttons).
   // Walk pages until there's no enabled Next button, we pass the start date,
@@ -124,6 +147,7 @@ export async function extractTransactionsFromPage(
 
     if (pageTransactions.length === 0) {
       // Nothing extracted on this page - no point paginating further
+      finished = true;
       break;
     }
 
@@ -132,6 +156,7 @@ export async function extractTransactionsFromPage(
     if (allTransactions.length === previousCount) {
       stableCount++;
       if (stableCount >= 3) {
+        finished = true;
         break;
       }
     } else {
@@ -146,6 +171,7 @@ export async function extractTransactionsFromPage(
         ...allTransactions.map((t) => t.date.getTime()),
       );
       if (oldestDate < startDate.getTime()) {
+        finished = true;
         break;
       }
     }
@@ -153,6 +179,7 @@ export async function extractTransactionsFromPage(
     // Move to the next page if there is one
     const advanced = await goToNextPage(page);
     if (!advanced) {
+      finished = true;
       break;
     }
     mode = advanced;
@@ -183,7 +210,7 @@ export async function extractTransactionsFromPage(
     filteredTransactions.length,
   );
 
-  return filteredTransactions;
+  return { transactions: filteredTransactions, truncated: !finished };
 }
 
 /**

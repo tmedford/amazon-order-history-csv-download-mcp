@@ -9,7 +9,7 @@ import {
   mapWithPages,
   shouldBlock,
 } from "../../../src/core/browser/lean-pages";
-import { toCSVWithColumns } from "../../../src/core/utils/csv";
+import { toCSV, toCSVWithColumns } from "../../../src/core/utils/csv";
 import {
   GIFT_CARD_CSV_COLUMNS,
   TRANSACTION_CSV_COLUMNS,
@@ -148,6 +148,10 @@ describe("concurrency", () => {
 });
 
 describe("CSV output", () => {
+  test("toCSV with no rows and no columns returns an empty string", () => {
+    expect(toCSV([])).toBe("");
+  });
+
   test("an empty export still has its header row", () => {
     const csv = toCSVWithColumns([], TRANSACTION_CSV_COLUMNS);
     expect(csv.replace("﻿", "").split("\n")[0]).toContain("Order");
