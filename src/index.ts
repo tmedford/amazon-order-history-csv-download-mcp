@@ -16,7 +16,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { execFileSync } from "child_process";
-import { readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "fs";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
 import packageMetadata from "../package.json";
@@ -127,10 +127,44 @@ function lockOwner(): { pid: number; ageMs: number } | null {
   }
 }
 
+// THE OWNER KEEPS ITS LOCK FRESH. The lock's age is how others judge staleness, so a
+// long-running owner touches it every few seconds; without this every owner looked older
+// than LOCK_GRACE_MS and one slow attach could delete a LIVE owner's lock (PR #1 review).
+const HEARTBEAT_MS = 5_000;
+let heartbeat: NodeJS.Timeout | null = null;
+function startHeartbeat(): void {
+  if (heartbeat) return;
+  heartbeat = setInterval(() => {
+    try {
+      const now = new Date();
+      utimesSync(LOCK_FILE, now, now);
+    } catch {
+      /* lock gone - the next open re-elects */
+    }
+  }, HEARTBEAT_MS);
+  heartbeat.unref();
+}
+function stopHeartbeat(): void {
+  if (heartbeat) clearInterval(heartbeat);
+  heartbeat = null;
+}
+
+/** Remove the lock only if it still belongs to `pid` and has stopped refreshing. */
+function unlinkIfStale(pid: number): void {
+  const o = lockOwner();
+  if (!o || o.pid !== pid || o.ageMs <= LOCK_GRACE_MS) return;
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {
+    /* someone else already cleaned it */
+  }
+}
+
 function tryAcquireLock(): boolean {
   try {
     writeFileSync(LOCK_FILE, String(process.pid), { flag: "wx" });
     holdsLock = true;
+    startHeartbeat();
     return true;
   } catch {
     let owner = NaN;
@@ -163,6 +197,7 @@ function tryAcquireLock(): boolean {
 function releaseLock(): void {
   if (!holdsLock) return;
   holdsLock = false;
+  stopHeartbeat();
   try {
     if (parseInt(readFileSync(LOCK_FILE, "utf8"), 10) === process.pid) {
       unlinkSync(LOCK_FILE);
@@ -228,13 +263,8 @@ async function openBrowserContext(): Promise<BrowserContext> {
         // A DevToolsActivePort left by a crashed run + a reused pid would keep the lock
         // looking alive forever. The endpoint not answering past the grace period is the
         // real test: take the lock over.
-        if (owner!.ageMs > LOCK_GRACE_MS) {
-          try {
-            unlinkSync(LOCK_FILE);
-          } catch {
-            /* someone else already cleaned it */
-          }
-        }
+        // only if it is still that owner's lock AND it stopped heartbeating
+        unlinkIfStale(owner!.pid);
       }
     }
     if (tryAcquireLock()) {
@@ -1869,7 +1899,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!before.ok) return signInError(region!, before);
   }
   const result = await runTool(request);
-  if (!guarded || result?.isError) return result;
+  if (!guarded) return result;
+  if (result?.isError) {
+    // the session can die DURING the call and surface as an error, not an empty list:
+    // send sign-in errors through the same repair-and-retry path, keep all others as-is
+    const text = String(result?.content?.[0]?.text ?? "");
+    if (!/sign[ -]?in|not logged in|authenticat|\/ap\/signin/i.test(text)) return result;
+    const g = guardFor(region!);
+    g.invalidate();
+    const after = await g.ensure();
+    if (!after.ok) return signInError(region!, after);
+    return runTool(request);
+  }
   // A signed-out page yields exactly an empty list. Before an empty result is returned
   // as "success", confirm the session is still alive - it can expire mid-call.
   let payload: unknown;
