@@ -15,6 +15,7 @@ import {
   ProgressNotification,
 } from "@modelcontextprotocol/sdk/types.js";
 import { chromium, Browser, BrowserContext, Page } from "playwright";
+import { execFileSync } from "child_process";
 import { readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
@@ -181,6 +182,28 @@ function dropBrowser(context: BrowserContext): void {
   }
 }
 
+// PRESENT AS THE USER'S OWN CHROME. The imported cookies belong to the installed Chrome,
+// and Amazon ties a session to the browser that holds it: with Chrome 153's cookies, a
+// fixed "Chrome/120" user agent was sent to the password page while "Chrome/153" got the
+// orders page - same cookies, same minute (2026-09-25). So the UA carries the installed
+// Chrome's major version, read from its Info.plist; the old fixed string is the fallback.
+function chromeUserAgent(): string {
+  let major = "120";
+  try {
+    const v = execFileSync(
+      "defaults",
+      ["read", "/Applications/Google Chrome.app/Contents/Info", "CFBundleShortVersionString"],
+      { timeout: 5000 },
+    )
+      .toString()
+      .trim();
+    if (/^\d+\./.test(v)) major = v.split(".")[0];
+  } catch {
+    /* Chrome not installed where expected - keep the fallback */
+  }
+  return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+}
+
 async function openBrowserContext(): Promise<BrowserContext> {
   const deadline = Date.now() + 60_000;
   let lastError: unknown;
@@ -219,8 +242,7 @@ async function openBrowserContext(): Promise<BrowserContext> {
         const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
           headless: HEADLESS,
           viewport: { width: 1280, height: 800 },
-          userAgent:
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          userAgent: chromeUserAgent(),
           args: [
             "--remote-debugging-port=0",
             "--remote-debugging-address=127.0.0.1",
@@ -257,6 +279,10 @@ async function importSessionFromChrome(context: BrowserContext): Promise<number>
   try {
     const imported = importAmazonCookiesFromChrome();
     if (imported.length > 0) {
+      // REPLACE, don't merge (Taylor, 2026-09-25): stale connector-only cookies (id_pk,
+      // id_pkel, ...) must not mix with Chrome's session. Cleared only once Chrome has
+      // cookies to give, so a failed import never leaves the browser with none.
+      await context.clearCookies({ domain: /(^|\.)amazon\.com$/ });
       await context.addCookies(imported);
       console.error(`[browser] Imported ${imported.length} amazon.com cookies from Chrome.`);
       return imported.length;
