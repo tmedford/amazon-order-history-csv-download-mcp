@@ -21,6 +21,7 @@ import { isAbsolute, join } from "path";
 import { homedir } from "os";
 import packageMetadata from "../package.json";
 import { importAmazonCookiesFromChrome } from "./core/cookie-import";
+import { AuthGuard, looksEmpty } from "./core/auth-guard";
 
 import { AmazonPlugin } from "./amazon/adapter";
 import { getRegionByCode, getRegionCodes } from "./amazon/regions";
@@ -163,6 +164,7 @@ async function openBrowserContext(): Promise<BrowserContext> {
         attachedBrowser = browser;
         browser.on("disconnected", () => dropBrowser(context));
         console.error(`[browser] Attached to the shared browser on ${CDP_URL}`);
+        await importSessionFromChrome(context);
         return context;
       }
       await browser.close();
@@ -184,7 +186,7 @@ async function openBrowserContext(): Promise<BrowserContext> {
         attachedBrowser = null;
         context.on("close", () => dropBrowser(context));
         console.error(`[browser] Launched the shared browser on ${CDP_URL}`);
-        await importSessionIfNeeded(context);
+        await importSessionFromChrome(context);
         return context;
       } catch (e) {
         lastError = e;
@@ -197,27 +199,22 @@ async function openBrowserContext(): Promise<BrowserContext> {
   throw new Error(`could not open or attach to the browser: ${String(lastError)}`);
 }
 
-async function importSessionIfNeeded(context: BrowserContext): Promise<void> {
-  // Only the OWNER runs this - an attached server sees a context that already has
-  // whatever session the owner established.
-  //
-  // Checking for merely *any* amazon.com cookie is not enough - a plain
-  // unauthenticated visit leaves anonymous cookies like session-id/ubid-main behind,
-  // and the profile persists on disk, so that false positive would permanently block
-  // cookie import. at-main/sess-at-main are Amazon's actual signed-in cookies.
-  const existingCookies = await context.cookies();
-  const AUTH_COOKIE_NAMES = ["at-main", "sess-at-main"];
-  const hasAmazonSession = existingCookies.some(
-    (c) => c.domain.includes("amazon.com") && AUTH_COOKIE_NAMES.includes(c.name)
-  );
-  if (hasAmazonSession) return;
+async function importSessionFromChrome(context: BrowserContext): Promise<number> {
+  // EVERY TIME THE CONNECTOR OPENS, copy Chrome's amazon.com cookies in - owner or
+  // attached. This used to run only for the owner, and only when the profile had no
+  // at-main/sess-at-main cookie at all. But the profile persists on disk, so once its
+  // OWN sign-in expired the stale cookie was still "present", import was skipped
+  // forever, and every call returned status "success" with 0 results while logged out
+  // (seen 2026-09-25). Chrome is where the user actually stays signed in, so its
+  // cookies are the fresher source; addCookies() overwrites same-name cookies.
   try {
     const imported = importAmazonCookiesFromChrome();
     if (imported.length > 0) {
       await context.addCookies(imported);
-      console.error(
-        `[browser] Imported ${imported.length} amazon.com cookies from Chrome - skipping manual login.`
-      );
+      console.error(`[browser] Imported ${imported.length} amazon.com cookies from Chrome.`);
+      return imported.length;
+    } else {
+      console.error("[browser] Chrome had no importable amazon.com cookies - manual login needed.");
     }
   } catch (e) {
     // Best-effort: failure just means the caller falls back to manual login.
@@ -225,6 +222,7 @@ async function importSessionIfNeeded(context: BrowserContext): Promise<void> {
       `[browser] Cookie import skipped: ${e instanceof Error ? e.message : "unknown error"}`
     );
   }
+  return 0;
 }
 
 async function getBrowserContext(): Promise<BrowserContext> {
@@ -930,7 +928,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function runTool(request: any): Promise<any> {
   const { name, arguments: args } = request.params;
 
   try {
@@ -1712,6 +1711,87 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
+}
+
+// ---- sign-in guard ------------------------------------------------------------------
+// Every tool call first makes sure the browser is signed in, re-importing Chrome's
+// cookies and retrying when it is not (see core/auth-guard.ts for why). One guard per
+// region, since each Amazon domain has its own session.
+const guards = new Map<string, AuthGuard>();
+
+function guardFor(region: string): AuthGuard {
+  let g = guards.get(region);
+  if (!g) {
+    g = new AuthGuard({
+      check: async () => {
+        const p = await getPage();
+        // Always load fresh: checkAuthStatus trusts whatever Amazon page is already
+        // open, which can be a stale signed-in view of a session that has since expired.
+        await p
+          .goto(amazonPlugin.getLoginUrl(region).replace("/ap/signin", "/gp/css/order-history"), {
+            waitUntil: "domcontentloaded",
+            timeout: 60000,
+          })
+          .catch(() => {});
+        const url = p.url();
+        // NOT max_auth_age=0: Amazon adds it to every order-history sign-in redirect.
+        const reauthRequired =
+          url.includes("/ap/cvf") ||
+          ((await p.locator("#ap_password").count()) > 0 && (await p.locator("#ap_email").count()) === 0);
+        const st = await amazonPlugin.checkAuthStatus(p, region);
+        return { authenticated: st.authenticated && !reauthRequired, reauthRequired, message: st.message };
+      },
+      reimport: async () => importSessionFromChrome(await getBrowserContext()),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      now: () => Date.now(),
+    });
+    guards.set(region, g);
+  }
+  return g;
+}
+
+function signInError(region: string, r: { code: string; message: string; attempts: number }) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          { status: "error", error: r.code, message: r.message, attempts: r.attempts, region,
+            loginUrl: amazonPlugin.getLoginUrl(region) },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: true,
+  };
+}
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const region = request.params.arguments?.region as string | undefined;
+  const guarded = !!region && getRegionCodes().includes(region);
+  if (guarded) {
+    const before = await guardFor(region!).ensure();
+    if (!before.ok) return signInError(region!, before);
+  }
+  const result = await runTool(request);
+  if (!guarded || result?.isError) return result;
+  // A signed-out page yields exactly an empty list. Before an empty result is returned
+  // as "success", confirm the session is still alive - it can expire mid-call.
+  let payload: unknown;
+  try {
+    payload = JSON.parse(result?.content?.[0]?.text ?? "");
+  } catch {
+    return result;
+  }
+  if (looksEmpty(payload)) {
+    const g = guardFor(region!);
+    g.invalidate();
+    const after = await g.ensure();
+    if (!after.ok) return signInError(region!, after);
+    if (after.repaired) return runTool(request); // the session was fixed - try once more
+  }
+  return result;
 });
 
 // Cleanup on exit. The owner closes the browser; an attached server only disconnects.
