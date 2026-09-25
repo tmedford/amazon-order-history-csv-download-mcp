@@ -1731,11 +1731,20 @@ async function runTool(request: any): Promise<any> {
 // region, since each Amazon domain has its own session.
 const guards = new Map<string, AuthGuard>();
 
+// Every region's check navigates the ONE shared page, so checks take turns: each guard
+// already coalesces its own callers, and this chain keeps two regions from racing goto().
+let checkChain: Promise<unknown> = Promise.resolve();
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const run = checkChain.then(fn, fn);
+  checkChain = run.catch(() => undefined);
+  return run;
+}
+
 function guardFor(region: string): AuthGuard {
   let g = guards.get(region);
   if (!g) {
     g = new AuthGuard({
-      check: async () => {
+      check: () => serialized(async () => {
         const p = await getPage();
         // Always load fresh: checkAuthStatus trusts whatever Amazon page is already
         // open, which can be a stale signed-in view of a session that has since expired.
@@ -1752,7 +1761,7 @@ function guardFor(region: string): AuthGuard {
           ((await p.locator("#ap_password").count()) > 0 && (await p.locator("#ap_email").count()) === 0);
         const st = await amazonPlugin.checkAuthStatus(p, region);
         return { authenticated: st.authenticated && !reauthRequired, reauthRequired, message: st.message };
-      },
+      }),
       reimport: async () => importSessionFromChrome(await getBrowserContext()),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       now: () => Date.now(),
