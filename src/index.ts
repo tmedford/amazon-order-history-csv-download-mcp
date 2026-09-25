@@ -14,10 +14,14 @@ import {
   Tool,
   ProgressNotification,
 } from "@modelcontextprotocol/sdk/types.js";
-import { chromium, BrowserContext, Page } from "playwright";
+import { chromium, Browser, BrowserContext, Page } from "playwright";
+import { execFileSync } from "child_process";
+import { readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "fs";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
 import packageMetadata from "../package.json";
+import { importAmazonCookiesFromChrome } from "./core/cookie-import";
+import { AuthGuard, looksEmpty } from "./core/auth-guard";
 
 import { AmazonPlugin } from "./amazon/adapter";
 import { getRegionByCode, getRegionCodes } from "./amazon/regions";
@@ -58,26 +62,289 @@ const BROWSER_DATA_DIR =
 /**
  * Get or create browser context instance.
  */
-async function getBrowserContext(): Promise<BrowserContext> {
-  if (!browserContext) {
-    const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
-      headless: false, // Need visible browser for login
-      viewport: { width: 1280, height: 800 },
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    });
-    browserContext = context;
-    // If the browser dies (crash, user closes the window, killed externally),
-    // drop the stale handle so the next tool call relaunches instead of
-    // failing forever with "browser has been closed"
-    context.on("close", () => {
-      if (browserContext === context) {
-        browserContext = null;
-        page = null;
-      }
-    });
+// Headless by default now that cookie import handles the common login case -
+// a headed browser sitting open for the life of the server was pure idle
+// memory once auth stopped requiring a visible window every time. Amazon
+// still occasionally forces a fresh password/passkey confirmation
+// (openid.pape.max_auth_age=0 on order-history pages) that a headless
+// browser has nowhere to render - when that happens, set
+// AMAZON_ORDERS_HEADFUL=1 for one run to get a visible window back.
+const HEADLESS = process.env.AMAZON_ORDERS_HEADFUL !== "1";
+
+// ONE BROWSER, MANY SERVERS. Every Claude Code session/window that has this MCP
+// configured spawns its own copy of this server, and they all share one Chromium
+// profile directory - which Chromium locks. Four servers meant one owned the browser
+// and the rest failed or hung, so a tool call worked or not depending on which server
+// answered. Now the first server launches the browser with a local debugging port and
+// every other server attaches to it over CDP. If the owner exits the browser goes with
+// it, the attached servers see "disconnected", and the next call elects a new owner.
+// The endpoint is NOT a predictable port: the owner launches with --remote-debugging-port=0
+// and Chromium writes the port and a per-run browser id into <profile>/DevToolsActivePort.
+// Attaching reads that file, so a server only ever attaches to the browser THIS profile
+// launched - never to whatever else listens on a guessable port, which would have been
+// handed decrypted Amazon cookies (PR #1 review).
+const DEVTOOLS_PORT_FILE = join(BROWSER_DATA_DIR, "DevToolsActivePort");
+// how long a lock owner may go without a browser answering before its lock is stale
+const LOCK_GRACE_MS = 15_000;
+
+function profileEndpoint(): string | null {
+  try {
+    const [port, path] = readFileSync(DEVTOOLS_PORT_FILE, "utf8").split("\n");
+    if (!/^\d+$/.test(port?.trim() ?? "") || !path?.startsWith("/devtools/browser/")) return null;
+    return `ws://127.0.0.1:${port.trim()}${path.trim()}`;
+  } catch {
+    return null;
   }
-  return browserContext;
+}
+
+// Set only when this server ATTACHED to someone else's browser. Shutdown must then
+// disconnect, never close - closing would kill the browser under the other servers.
+let attachedBrowser: Browser | null = null;
+
+// Headless Chromium does NOT enforce one-browser-per-profile: two servers launching at
+// once both "succeeded", ran two browsers on one profile directory, and only one could
+// bind the debugging port. So election is done here, with an O_EXCL lockfile holding the
+// owner's pid. A lock whose pid is dead is stale and is taken over.
+const LOCK_FILE = `${BROWSER_DATA_DIR}.owner.lock`;
+let holdsLock = false;
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM: the process exists but belongs to another user - alive, not stale
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function lockOwner(): { pid: number; ageMs: number } | null {
+  try {
+    const pid = parseInt(readFileSync(LOCK_FILE, "utf8"), 10);
+    return { pid, ageMs: Date.now() - statSync(LOCK_FILE).mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+// THE OWNER KEEPS ITS LOCK FRESH. The lock's age is how others judge staleness, so a
+// long-running owner touches it every few seconds; without this every owner looked older
+// than LOCK_GRACE_MS and one slow attach could delete a LIVE owner's lock (PR #1 review).
+const HEARTBEAT_MS = 5_000;
+let heartbeat: NodeJS.Timeout | null = null;
+function startHeartbeat(): void {
+  if (heartbeat) return;
+  heartbeat = setInterval(() => {
+    try {
+      const now = new Date();
+      utimesSync(LOCK_FILE, now, now);
+    } catch {
+      /* lock gone - the next open re-elects */
+    }
+  }, HEARTBEAT_MS);
+  heartbeat.unref();
+}
+function stopHeartbeat(): void {
+  if (heartbeat) clearInterval(heartbeat);
+  heartbeat = null;
+}
+
+/** Remove the lock only if it still belongs to `pid` and has stopped refreshing. */
+function unlinkIfStale(pid: number): void {
+  const o = lockOwner();
+  if (!o || o.pid !== pid || o.ageMs <= LOCK_GRACE_MS) return;
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {
+    /* someone else already cleaned it */
+  }
+}
+
+function tryAcquireLock(): boolean {
+  try {
+    writeFileSync(LOCK_FILE, String(process.pid), { flag: "wx" });
+    holdsLock = true;
+    startHeartbeat();
+    return true;
+  } catch {
+    let owner = NaN;
+    try {
+      owner = parseInt(readFileSync(LOCK_FILE, "utf8"), 10);
+    } catch {
+      return false; // vanished between the two calls - next loop retries
+    }
+    // Stale if the owner died - OR if its pid is alive but no browser has answered for
+    // longer than the grace period. After a crash or reboot the old pid is often reused by
+    // an unrelated process, and a pid check alone would then block every server forever.
+    const ageMs = (() => {
+      try {
+        return Date.now() - statSync(LOCK_FILE).mtimeMs;
+      } catch {
+        return 0;
+      }
+    })();
+    if (!pidAlive(owner) || (ageMs > LOCK_GRACE_MS && !profileEndpoint())) {
+      try {
+        unlinkSync(LOCK_FILE);
+      } catch {
+        /* someone else already cleaned it */
+      }
+    }
+    return false;
+  }
+}
+
+function releaseLock(): void {
+  if (!holdsLock) return;
+  holdsLock = false;
+  stopHeartbeat();
+  try {
+    if (parseInt(readFileSync(LOCK_FILE, "utf8"), 10) === process.pid) {
+      unlinkSync(LOCK_FILE);
+    }
+  } catch {
+    /* already gone */
+  }
+}
+process.on("exit", releaseLock);
+
+function dropBrowser(context: BrowserContext): void {
+  if (browserContext === context) {
+    browserContext = null;
+    page = null;
+    attachedBrowser = null;
+    releaseLock();
+  }
+}
+
+// PRESENT AS THE USER'S OWN CHROME. The imported cookies belong to the installed Chrome,
+// and Amazon ties a session to the browser that holds it: with Chrome 153's cookies, a
+// fixed "Chrome/120" user agent was sent to the password page while "Chrome/153" got the
+// orders page - same cookies, same minute (2026-09-25). So the UA carries the installed
+// Chrome's major version, read from its Info.plist; the old fixed string is the fallback.
+function chromeUserAgent(): string {
+  let major = "120";
+  try {
+    const v = execFileSync(
+      "defaults",
+      ["read", "/Applications/Google Chrome.app/Contents/Info", "CFBundleShortVersionString"],
+      { timeout: 5000 },
+    )
+      .toString()
+      .trim();
+    if (/^\d+\./.test(v)) major = v.split(".")[0];
+  } catch {
+    /* Chrome not installed where expected - keep the fallback */
+  }
+  return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+}
+
+async function openBrowserContext(): Promise<BrowserContext> {
+  const deadline = Date.now() + 60_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    // attach only to the browser this profile's live lock owner launched
+    const owner = lockOwner();
+    const endpoint = owner && owner.pid !== process.pid && pidAlive(owner.pid) ? profileEndpoint() : null;
+    if (endpoint) {
+      try {
+        const browser = await chromium.connectOverCDP(endpoint, { timeout: 2000 });
+        const context = browser.contexts()[0];
+        if (context) {
+          attachedBrowser = browser;
+          browser.on("disconnected", () => dropBrowser(context));
+          console.error(`[browser] Attached to the shared browser (owner pid ${owner!.pid})`);
+          await importSessionFromChrome(context);
+          return context;
+        }
+        await browser.close();
+      } catch (e) {
+        lastError = e; // stale DevToolsActivePort or the owner is still starting
+        // A DevToolsActivePort left by a crashed run + a reused pid would keep the lock
+        // looking alive forever. The endpoint not answering past the grace period is the
+        // real test: take the lock over.
+        // only if it is still that owner's lock AND it stopped heartbeating
+        unlinkIfStale(owner!.pid);
+      }
+    }
+    if (tryAcquireLock()) {
+      try {
+        const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
+          headless: HEADLESS,
+          viewport: { width: 1280, height: 800 },
+          userAgent: chromeUserAgent(),
+          args: [
+            "--remote-debugging-port=0",
+            "--remote-debugging-address=127.0.0.1",
+          ],
+        });
+        attachedBrowser = null;
+        context.on("close", () => dropBrowser(context));
+        console.error(`[browser] Launched the shared browser (endpoint in ${DEVTOOLS_PORT_FILE})`);
+        await importSessionFromChrome(context);
+        return context;
+      } catch (e) {
+        lastError = e;
+        releaseLock();
+      }
+    }
+    // an owner is launching (or just died) - give it a moment, then try to attach
+    if (!lastError) {
+      const o = lockOwner();
+      lastError = o ? `lock held by pid ${o.pid} for ${Math.round(o.ageMs / 1000)}s with no browser answering` : "no owner";
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  throw new Error(`could not open or attach to the browser: ${String(lastError)}`);
+}
+
+async function importSessionFromChrome(context: BrowserContext): Promise<number> {
+  // EVERY TIME THE CONNECTOR OPENS, copy Chrome's amazon.com cookies in - owner or
+  // attached. This used to run only for the owner, and only when the profile had no
+  // at-main/sess-at-main cookie at all. But the profile persists on disk, so once its
+  // OWN sign-in expired the stale cookie was still "present", import was skipped
+  // forever, and every call returned status "success" with 0 results while logged out
+  // (seen 2026-09-25). Chrome is where the user actually stays signed in, so its
+  // cookies are the fresher source; addCookies() overwrites same-name cookies.
+  try {
+    const imported = importAmazonCookiesFromChrome();
+    if (imported.length > 0) {
+      // REPLACE, don't merge (Taylor, 2026-09-25): stale connector-only cookies (id_pk,
+      // id_pkel, ...) must not mix with Chrome's session. Cleared only once Chrome has
+      // cookies to give, so a failed import never leaves the browser with none.
+      await context.clearCookies({ domain: /(^|\.)amazon\.com$/ });
+      await context.addCookies(imported);
+      console.error(`[browser] Imported ${imported.length} amazon.com cookies from Chrome.`);
+      return imported.length;
+    } else {
+      console.error("[browser] Chrome had no importable amazon.com cookies - manual login needed.");
+    }
+  } catch (e) {
+    // Best-effort: failure just means the caller falls back to manual login.
+    console.error(
+      `[browser] Cookie import skipped: ${e instanceof Error ? e.message : "unknown error"}`
+    );
+  }
+  return 0;
+}
+
+// One open at a time: two concurrent calls used to both run openBrowserContext(), one
+// launching and one attaching, leaving a lock owner that thought it was attached.
+let opening: Promise<BrowserContext> | null = null;
+
+async function getBrowserContext(): Promise<BrowserContext> {
+  if (browserContext) return browserContext;
+  if (!opening) {
+    opening = openBrowserContext()
+      .then((ctx) => {
+        browserContext = ctx;
+        return ctx;
+      })
+      .finally(() => {
+        opening = null;
+      });
+  }
+  return opening;
 }
 
 /**
@@ -87,8 +354,7 @@ async function getPage(): Promise<Page> {
   try {
     const context = await getBrowserContext();
     if (!page || page.isClosed()) {
-      const pages = context.pages();
-      page = pages[0] || (await context.newPage());
+      page = await context.newPage();
     }
     return page;
   } catch (e) {
@@ -97,7 +363,7 @@ async function getPage(): Promise<Page> {
     browserContext = null;
     page = null;
     const context = await getBrowserContext();
-    page = context.pages()[0] || (await context.newPage());
+    page = await context.newPage();
     return page;
   }
 }
@@ -777,7 +1043,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function runTool(request: any): Promise<any> {
   const { name, arguments: args } = request.params;
 
   try {
@@ -1559,20 +1826,129 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
+}
+
+// ---- sign-in guard ------------------------------------------------------------------
+// Every tool call first makes sure the browser is signed in, re-importing Chrome's
+// cookies and retrying when it is not (see core/auth-guard.ts for why). One guard per
+// region, since each Amazon domain has its own session.
+const guards = new Map<string, AuthGuard>();
+
+// Every region's check navigates the ONE shared page, so checks take turns: each guard
+// already coalesces its own callers, and this chain keeps two regions from racing goto().
+let checkChain: Promise<unknown> = Promise.resolve();
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const run = checkChain.then(fn, fn);
+  checkChain = run.catch(() => undefined);
+  return run;
+}
+
+function guardFor(region: string): AuthGuard {
+  let g = guards.get(region);
+  if (!g) {
+    g = new AuthGuard({
+      check: () => serialized(async () => {
+        const p = await getPage();
+        // Always load fresh: checkAuthStatus trusts whatever Amazon page is already
+        // open, which can be a stale signed-in view of a session that has since expired.
+        await p
+          .goto(amazonPlugin.getLoginUrl(region).replace("/ap/signin", "/gp/css/order-history"), {
+            waitUntil: "domcontentloaded",
+            timeout: 60000,
+          })
+          .catch(() => {});
+        const url = p.url();
+        // NOT max_auth_age=0: Amazon adds it to every order-history sign-in redirect.
+        const reauthRequired =
+          url.includes("/ap/cvf") ||
+          ((await p.locator("#ap_password").count()) > 0 && (await p.locator("#ap_email").count()) === 0);
+        const st = await amazonPlugin.checkAuthStatus(p, region);
+        return { authenticated: st.authenticated && !reauthRequired, reauthRequired, message: st.message };
+      }),
+      reimport: async () => importSessionFromChrome(await getBrowserContext()),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      now: () => Date.now(),
+    });
+    guards.set(region, g);
+  }
+  return g;
+}
+
+function signInError(region: string, r: { code: string; message: string; attempts: number }) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          { status: "error", error: r.code, message: r.message, attempts: r.attempts, region,
+            loginUrl: amazonPlugin.getLoginUrl(region) },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: true,
+  };
+}
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const region = request.params.arguments?.region as string | undefined;
+  const guarded = !!region && getRegionCodes().includes(region);
+  if (guarded) {
+    const before = await guardFor(region!).ensure();
+    if (!before.ok) return signInError(region!, before);
+  }
+  const result = await runTool(request);
+  if (!guarded) return result;
+  if (result?.isError) {
+    // the session can die DURING the call and surface as an error, not an empty list:
+    // send sign-in errors through the same repair-and-retry path, keep all others as-is
+    const text = String(result?.content?.[0]?.text ?? "");
+    if (!/sign[ -]?in|not logged in|authenticat|\/ap\/signin/i.test(text)) return result;
+    const g = guardFor(region!);
+    g.invalidate();
+    const after = await g.ensure();
+    if (!after.ok) return signInError(region!, after);
+    return runTool(request);
+  }
+  // A signed-out page yields exactly an empty list. Before an empty result is returned
+  // as "success", confirm the session is still alive - it can expire mid-call.
+  let payload: unknown;
+  try {
+    payload = JSON.parse(result?.content?.[0]?.text ?? "");
+  } catch {
+    return result;
+  }
+  if (looksEmpty(payload)) {
+    const g = guardFor(region!);
+    g.invalidate();
+    const after = await g.ensure();
+    if (!after.ok) return signInError(region!, after);
+    if (after.repaired) return runTool(request); // the session was fixed - try once more
+  }
+  return result;
 });
 
-// Cleanup on exit
-process.on("SIGINT", async () => {
-  if (browserContext) {
-    await browserContext.close();
+// Cleanup on exit. The owner closes the browser; an attached server only disconnects.
+async function shutdownBrowser(): Promise<void> {
+  try {
+    if (attachedBrowser) {
+      await attachedBrowser.close();
+    } else if (browserContext) {
+      await browserContext.close();
+    }
+  } catch {
+    // already gone
   }
+}
+
+process.on("SIGINT", async () => {
+  await shutdownBrowser();
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
-  if (browserContext) {
-    await browserContext.close();
-  }
+  await shutdownBrowser();
   process.exit(0);
 });
 

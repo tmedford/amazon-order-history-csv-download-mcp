@@ -270,7 +270,14 @@ export async function fetchOrders(
         `[fetch-orders] Invoice data: subtotal=${invoiceData.subtotal?.formatted}, total=${invoiceData.total?.formatted}, vat=${invoiceData.vat?.formatted}, shipping=${invoiceData.shipping?.formatted}`,
       );
       if (invoiceData.subtotal) enrichedOrder.subtotal = invoiceData.subtotal;
-      if (invoiceData.total) enrichedOrder.grandTotal = invoiceData.total;
+      if (invoiceData.total) {
+        // grandTotal is the detailed breakdown field; total is what every
+        // caller (get_amazon_order_details, CSV exports) actually reports.
+        // This path only ever set grandTotal, so total stayed at the $0
+        // placeholder from the header above on every single-order fetch.
+        enrichedOrder.grandTotal = invoiceData.total;
+        enrichedOrder.total = invoiceData.total;
+      }
       if (invoiceData.shipping) enrichedOrder.shipping = invoiceData.shipping;
       if (invoiceData.tax) enrichedOrder.tax = invoiceData.tax;
       if (invoiceData.vat) enrichedOrder.vat = invoiceData.vat;
@@ -298,6 +305,8 @@ export async function fetchOrders(
       if (invoiceData.items && invoiceData.items.length > 0) {
         const enrichedHeader: OrderHeader = {
           ...header,
+          // the invoice total, not the header's $0 placeholder - items carry this header
+          total: enrichedOrder.total,
           recipient:
             typeof enrichedOrder.recipient === "string"
               ? enrichedOrder.recipient
