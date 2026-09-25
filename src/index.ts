@@ -15,8 +15,7 @@ import {
   ProgressNotification,
 } from "@modelcontextprotocol/sdk/types.js";
 import { chromium, Browser, BrowserContext, Page } from "playwright";
-import { createHash } from "crypto";
-import { readFileSync, unlinkSync, writeFileSync } from "fs";
+import { readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
 import packageMetadata from "../package.json";
@@ -78,15 +77,24 @@ const HEADLESS = process.env.AMAZON_ORDERS_HEADFUL !== "1";
 // answered. Now the first server launches the browser with a local debugging port and
 // every other server attaches to it over CDP. If the owner exits the browser goes with
 // it, the attached servers see "disconnected", and the next call elects a new owner.
-const CDP_PORT =
-  Number(process.env.AMAZON_ORDERS_CDP_PORT) ||
-  20000 +
-    (parseInt(
-      createHash("sha1").update(BROWSER_DATA_DIR).digest("hex").slice(0, 6),
-      16
-    ) %
-      10000);
-const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
+// The endpoint is NOT a predictable port: the owner launches with --remote-debugging-port=0
+// and Chromium writes the port and a per-run browser id into <profile>/DevToolsActivePort.
+// Attaching reads that file, so a server only ever attaches to the browser THIS profile
+// launched - never to whatever else listens on a guessable port, which would have been
+// handed decrypted Amazon cookies (PR #1 review).
+const DEVTOOLS_PORT_FILE = join(BROWSER_DATA_DIR, "DevToolsActivePort");
+// how long a lock owner may go without a browser answering before its lock is stale
+const LOCK_GRACE_MS = 15_000;
+
+function profileEndpoint(): string | null {
+  try {
+    const [port, path] = readFileSync(DEVTOOLS_PORT_FILE, "utf8").split("\n");
+    if (!/^\d+$/.test(port?.trim() ?? "") || !path?.startsWith("/devtools/browser/")) return null;
+    return `ws://127.0.0.1:${port.trim()}${path.trim()}`;
+  } catch {
+    return null;
+  }
+}
 
 // Set only when this server ATTACHED to someone else's browser. Shutdown must then
 // disconnect, never close - closing would kill the browser under the other servers.
@@ -103,8 +111,18 @@ function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
+  } catch (e) {
+    // EPERM: the process exists but belongs to another user - alive, not stale
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function lockOwner(): { pid: number; ageMs: number } | null {
+  try {
+    const pid = parseInt(readFileSync(LOCK_FILE, "utf8"), 10);
+    return { pid, ageMs: Date.now() - statSync(LOCK_FILE).mtimeMs };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -120,9 +138,19 @@ function tryAcquireLock(): boolean {
     } catch {
       return false; // vanished between the two calls - next loop retries
     }
-    if (!pidAlive(owner)) {
+    // Stale if the owner died - OR if its pid is alive but no browser has answered for
+    // longer than the grace period. After a crash or reboot the old pid is often reused by
+    // an unrelated process, and a pid check alone would then block every server forever.
+    const ageMs = (() => {
       try {
-        unlinkSync(LOCK_FILE); // stale: the owner died without releasing
+        return Date.now() - statSync(LOCK_FILE).mtimeMs;
+      } catch {
+        return 0;
+      }
+    })();
+    if (!pidAlive(owner) || (ageMs > LOCK_GRACE_MS && !profileEndpoint())) {
+      try {
+        unlinkSync(LOCK_FILE);
       } catch {
         /* someone else already cleaned it */
       }
@@ -157,19 +185,24 @@ async function openBrowserContext(): Promise<BrowserContext> {
   const deadline = Date.now() + 60_000;
   let lastError: unknown;
   while (Date.now() < deadline) {
-    try {
-      const browser = await chromium.connectOverCDP(CDP_URL, { timeout: 2000 });
-      const context = browser.contexts()[0];
-      if (context) {
-        attachedBrowser = browser;
-        browser.on("disconnected", () => dropBrowser(context));
-        console.error(`[browser] Attached to the shared browser on ${CDP_URL}`);
-        await importSessionFromChrome(context);
-        return context;
+    // attach only to the browser this profile's live lock owner launched
+    const owner = lockOwner();
+    const endpoint = owner && owner.pid !== process.pid && pidAlive(owner.pid) ? profileEndpoint() : null;
+    if (endpoint) {
+      try {
+        const browser = await chromium.connectOverCDP(endpoint, { timeout: 2000 });
+        const context = browser.contexts()[0];
+        if (context) {
+          attachedBrowser = browser;
+          browser.on("disconnected", () => dropBrowser(context));
+          console.error(`[browser] Attached to the shared browser (owner pid ${owner!.pid})`);
+          await importSessionFromChrome(context);
+          return context;
+        }
+        await browser.close();
+      } catch (e) {
+        lastError = e; // stale DevToolsActivePort or the owner is still starting
       }
-      await browser.close();
-    } catch {
-      // nobody is serving a browser yet
     }
     if (tryAcquireLock()) {
       try {
@@ -179,13 +212,13 @@ async function openBrowserContext(): Promise<BrowserContext> {
           userAgent:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           args: [
-            `--remote-debugging-port=${CDP_PORT}`,
+            "--remote-debugging-port=0",
             "--remote-debugging-address=127.0.0.1",
           ],
         });
         attachedBrowser = null;
         context.on("close", () => dropBrowser(context));
-        console.error(`[browser] Launched the shared browser on ${CDP_URL}`);
+        console.error(`[browser] Launched the shared browser (endpoint in ${DEVTOOLS_PORT_FILE})`);
         await importSessionFromChrome(context);
         return context;
       } catch (e) {
@@ -194,6 +227,10 @@ async function openBrowserContext(): Promise<BrowserContext> {
       }
     }
     // an owner is launching (or just died) - give it a moment, then try to attach
+    if (!lastError) {
+      const o = lockOwner();
+      lastError = o ? `lock held by pid ${o.pid} for ${Math.round(o.ageMs / 1000)}s with no browser answering` : "no owner";
+    }
     await new Promise((r) => setTimeout(r, 400));
   }
   throw new Error(`could not open or attach to the browser: ${String(lastError)}`);

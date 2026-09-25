@@ -305,6 +305,8 @@ export async function fetchOrders(
       if (invoiceData.items && invoiceData.items.length > 0) {
         const enrichedHeader: OrderHeader = {
           ...header,
+          // the invoice total, not the header's $0 placeholder - items carry this header
+          total: enrichedOrder.total,
           recipient:
             typeof enrichedOrder.recipient === "string"
               ? enrichedOrder.recipient
