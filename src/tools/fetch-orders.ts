@@ -18,6 +18,11 @@ import {
 } from "../amazon/extractors";
 import { extractFromInvoice } from "../amazon/extractors/invoice";
 import { getRegionByCode } from "../amazon/regions";
+import {
+  concurrency,
+  mapOnPage,
+  mapWithPages,
+} from "../core/browser/lean-pages";
 
 /**
  * Parse invoice address lines into simple line1-line7 structure.
@@ -64,6 +69,11 @@ export interface FetchOrdersOptions {
   fetchTrackingNumbers?: boolean;
   useInvoice?: boolean;
   maxOrders?: number;
+  /**
+   * Orders enriched at once, each on its own lean page. Default: AMAZON_ORDERS_CONCURRENCY
+   * or 4. At 1, orders are processed one after another on `page` itself.
+   */
+  concurrency?: number;
   /** Filter to a specific order ID (for get_amazon_order_details) */
   orderId?: string;
   onProgress?: (message: string, current: number, total: number) => void;
@@ -573,45 +583,33 @@ export async function fetchOrders(
       result.totalFound,
     );
 
-    // If detailed extraction requested, visit each order
+    // If detailed extraction requested, visit each order - on lean worker pages, several
+    // at once (see core/browser/lean-pages.ts). Results are merged back in list order.
     if (includeItems || includeShipments || includeTransactions) {
       const startTime = Date.now();
+      const total = result.orders.length;
       let processedCount = 0;
 
-      for (let i = 0; i < result.orders.length; i++) {
-        const order = result.orders[i];
-
-        // Calculate ETA based on average time per order
-        const elapsed = Date.now() - startTime;
-        const avgTimePerOrder =
-          processedCount > 0
-            ? elapsed / processedCount
-            : useInvoice
-              ? 1500
-              : 3000;
-        const remaining = result.orders.length - i;
-        const etaSeconds = Math.round((avgTimePerOrder * remaining) / 1000);
-        const etaStr =
-          etaSeconds > 60
-            ? `~${Math.round(etaSeconds / 60)}m ${etaSeconds % 60}s`
-            : `~${etaSeconds}s`;
-
+      type OrderOut = {
+        items: Item[];
+        shipments: Shipment[];
+        transactions: Transaction[];
+      };
+      const processOne = async (
+        wp: Page,
+        order: EnrichedOrder,
+        i: number,
+        out: OrderOut,
+      ): Promise<OrderOut> => {
         console.error(
-          `[fetch-orders] Processing order ${i + 1}/${result.orders.length}: ${order.id} (${extractionMode} mode)`,
+          `[fetch-orders] Processing order ${i + 1}/${total}: ${order.id} (${extractionMode} mode)`,
         );
-        onProgress?.(
-          `Order ${i + 1}/${result.orders.length} (${order.id}) - ETA: ${etaStr}`,
-          i + 1,
-          result.orders.length,
-        );
-
         // Skip cancelled orders - they have no useful detail to extract
         const orderStatus = order.status?.label?.toLowerCase() || "";
         if (orderStatus === "cancelled") {
           console.error(`[fetch-orders] Skipping cancelled order ${order.id}`);
           order.items = [];
-          processedCount++;
-          continue;
+          return out;
         }
 
         // Create header for extraction functions
@@ -644,11 +642,11 @@ export async function fetchOrders(
               `[fetch-orders] Using invoice extraction for ${order.id}`,
             );
             onProgress?.(
-              `Order ${i + 1}/${result.orders.length} - Loading invoice...`,
+              `Order ${i + 1}/${total} - Loading invoice...`,
               i,
-              result.orders.length,
+              total,
             );
-            const invoiceData = await extractFromInvoice(page, header);
+            const invoiceData = await extractFromInvoice(wp, header);
 
             // Merge all invoice data into order (amounts, recipient, payments)
             if (invoiceData.subtotal) order.subtotal = invoiceData.subtotal;
@@ -726,7 +724,7 @@ export async function fetchOrders(
                     amount: ii.unitPrice.amount * ii.quantity,
                   },
                   url: ii.asin
-                    ? `https://www.${regionConfig.domain}/dp/${ii.asin}`
+                    ? `https://www.${regionConfig!.domain}/dp/${ii.asin}`
                     : "",
                   orderHeader: enrichedHeader,
                   condition: ii.condition,
@@ -737,7 +735,7 @@ export async function fetchOrders(
                 console.error(
                   `[fetch-orders] Found ${items.length} items from invoice (expected ${expectedItemCount})`,
                 );
-                result.items.push(...items);
+                out.items.push(...items);
                 order.items = items;
               } else {
                 // Fallback to detail page if:
@@ -746,22 +744,22 @@ export async function fetchOrders(
                 console.error(
                   `[fetch-orders] Invoice has ${invoiceItemCount} items but expected ${expectedItemCount}, falling back to detail page`,
                 );
-                await page.goto(order.detailUrl, {
+                await wp.goto(order.detailUrl, {
                   waitUntil: "domcontentloaded",
                   timeout: 15000,
                 });
-                await page
+                await wp
                   .waitForSelector('.a-box, [data-component="orderDetails"]', {
                     timeout: 1000,
                   })
                   .catch(() => {});
                 const items = await plugin
-                  .extractItems(page, enrichedHeader)
+                  .extractItems(wp, enrichedHeader)
                   .catch(() => []);
                 console.error(
                   `[fetch-orders] Found ${items.length} items from detail page`,
                 );
-                result.items.push(...items);
+                out.items.push(...items);
                 order.items = items;
               }
             }
@@ -772,55 +770,53 @@ export async function fetchOrders(
                 `[fetch-orders] Fetching shipments from detail page`,
               );
               onProgress?.(
-                `Order ${i + 1}/${result.orders.length} - Fetching shipments...`,
+                `Order ${i + 1}/${total} - Fetching shipments...`,
                 i,
-                result.orders.length,
+                total,
               );
-              await page.goto(order.detailUrl, {
+              await wp.goto(order.detailUrl, {
                 waitUntil: "domcontentloaded",
                 timeout: 15000,
               });
-              await page
+              await wp
                 .waitForSelector(
                   '[data-component="shipments"], .shipment-is-delivered, .a-box',
                   { timeout: 1000 },
                 )
                 .catch(() => {});
               const shipments = await plugin
-                .extractShipments(page, header, fetchTrackingNumbers)
+                .extractShipments(wp, header, fetchTrackingNumbers)
                 .catch(() => []);
-              result.shipments.push(...shipments);
+              out.shipments.push(...shipments);
               order.shipments = shipments;
             }
 
             // Transactions from detail page
             if (includeTransactions) {
               if (!includeShipments) {
-                await page.goto(order.detailUrl, {
+                await wp.goto(order.detailUrl, {
                   waitUntil: "domcontentloaded",
                   timeout: 15000,
                 });
               }
               const transactions = await plugin
-                .extractTransactions(page, header)
+                .extractTransactions(wp, header)
                 .catch(() => []);
-              result.transactions.push(...transactions);
+              out.transactions.push(...transactions);
             }
-
-            processedCount++;
           } else {
             // Detail page extraction (original method)
             console.error(`[fetch-orders] Navigating to: ${order.detailUrl}`);
             onProgress?.(
-              `Order ${i + 1}/${result.orders.length} - Loading details...`,
+              `Order ${i + 1}/${total} - Loading details...`,
               i,
-              result.orders.length,
+              total,
             );
-            await page.goto(order.detailUrl, {
+            await wp.goto(order.detailUrl, {
               waitUntil: "domcontentloaded",
               timeout: 30000,
             });
-            await page
+            await wp
               .waitForSelector(
                 '#od-subtotals, [data-component="orderDetails"], .order-details, .a-box',
                 { timeout: 1500 },
@@ -833,7 +829,7 @@ export async function fetchOrders(
 
             // Order details extraction
             extractionPromises.push(
-              extractOrderDetails(page, region)
+              extractOrderDetails(wp, region)
                 .then((details) => {
                   Object.assign(order, details);
                   console.error(`[fetch-orders] Order details extracted`);
@@ -845,10 +841,10 @@ export async function fetchOrders(
             if (includeItems) {
               extractionPromises.push(
                 plugin
-                  .extractItems(page, header)
+                  .extractItems(wp, header)
                   .then((items) => {
                     console.error(`[fetch-orders] Found ${items.length} items`);
-                    result.items.push(...items);
+                    out.items.push(...items);
                     order.items = items;
                   })
                   .catch(() => {
@@ -861,9 +857,9 @@ export async function fetchOrders(
             if (includeShipments) {
               extractionPromises.push(
                 plugin
-                  .extractShipments(page, header, fetchTrackingNumbers)
+                  .extractShipments(wp, header, fetchTrackingNumbers)
                   .then((shipments) => {
-                    result.shipments.push(...shipments);
+                    out.shipments.push(...shipments);
                     order.shipments = shipments;
                   })
                   .catch(() => {}),
@@ -874,9 +870,9 @@ export async function fetchOrders(
             if (includeTransactions) {
               extractionPromises.push(
                 plugin
-                  .extractTransactions(page, header)
+                  .extractTransactions(wp, header)
                   .then((transactions) => {
-                    result.transactions.push(...transactions);
+                    out.transactions.push(...transactions);
                   })
                   .catch(() => {}),
               );
@@ -884,13 +880,51 @@ export async function fetchOrders(
 
             // Wait for all extractions to complete
             await Promise.all(extractionPromises);
-            processedCount++;
           }
         } catch (error) {
-          result.errors.push(`Error extracting order ${order.id}: ${error}`);
-          processedCount++;
+          throw new Error(String(error));
         }
-      }
+        return out;
+      };
+
+      const enrich = async (
+        wp: Page,
+        order: EnrichedOrder,
+        i: number,
+      ): Promise<OrderOut> => {
+        const out: OrderOut = { items: [], shipments: [], transactions: [] };
+        try {
+          return await processOne(wp, order, i, out);
+        } finally {
+          processedCount++;
+          const elapsed = Date.now() - startTime;
+          const eta = Math.round(
+            ((elapsed / processedCount) * (total - processedCount)) / 1000,
+          );
+          onProgress?.(
+            `Order ${processedCount}/${total} (${order.id}) - ETA: ~${eta}s`,
+            processedCount,
+            total,
+          );
+        }
+      };
+
+      const workers = options.concurrency ?? concurrency();
+      const perOrder = await (workers <= 1
+        ? mapOnPage(page, result.orders, enrich)
+        : mapWithPages(page.context(), result.orders, enrich, workers));
+
+      perOrder.forEach((r, i) => {
+        if (r instanceof Error) {
+          result.errors.push(
+            `Error extracting order ${result.orders[i].id}: ${r}`,
+          );
+          return;
+        }
+        result.items.push(...r.items);
+        result.shipments.push(...r.shipments);
+        result.transactions.push(...r.transactions);
+      });
     }
 
     onProgress?.(

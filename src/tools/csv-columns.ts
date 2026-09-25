@@ -76,6 +76,12 @@ function formatMoney(money: Money | undefined): string {
   return `${money.currencySymbol}${money.amount.toFixed(2)}`;
 }
 
+/** A balance is a reading, not a charge: $0.00 is a value, so it is never blanked. */
+function formatBalance(money: Money | undefined): string {
+  if (!money) return "";
+  return `${money.currencySymbol}${money.amount.toFixed(2)}`;
+}
+
 /**
  * Format date for CSV output.
  */
@@ -411,7 +417,7 @@ export const GIFT_CARD_CSV_COLUMNS: CSVColumn<GiftCardTransactionCSVData>[] = [
   {
     key: "closingBalance",
     header: "Closing Balance",
-    getValue: (t) => formatMoney(t.closingBalance),
+    getValue: (t) => formatBalance(t.closingBalance),
   },
   { key: "orderId", header: "Order ID", getValue: (t) => t.orderId || "" },
   {

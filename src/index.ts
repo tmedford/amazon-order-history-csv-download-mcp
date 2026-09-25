@@ -38,7 +38,8 @@ import {
   downloadAmazonInvoice,
   isValidAmazonOrderId,
 } from "./tools";
-import { extractTransactionsFromPage } from "./amazon/extractors/transactions-page";
+import { walkTransactionsPage } from "./amazon/extractors/transactions-page";
+import { openLeanPage } from "./core/browser/lean-pages";
 import {
   extractGiftCardData,
   GiftCardData,
@@ -368,6 +369,42 @@ async function getPage(): Promise<Page> {
   }
 }
 
+const TRUNCATED_WARNING =
+  "Partial: hit the max_scrolls page cap before reaching start_date (or the end of history), so older charges were not read. Raise max_scrolls.";
+
+/**
+ * Walk the payments page on a lean page (HTML only - see core/browser/lean-pages.ts).
+ * Dates are YYYY-MM-DD and BOTH ends are inclusive: charges are stamped at local
+ * midnight (04:00Z in New York), so `new Date(endDate)` - 00:00Z - used to drop every
+ * charge made on the end date itself.
+ */
+async function scrapeTransactions(
+  region: string,
+  opts: {
+    startDate?: string;
+    endDate?: string;
+    maxScrolls?: number;
+    onProgress?: (message: string, count: number) => void | Promise<void>;
+  },
+) {
+  const context = await getBrowserContext();
+  const lean = await openLeanPage(context);
+  try {
+    return await walkTransactionsPage(lean, region, {
+      startDate: opts.startDate
+        ? new Date(`${opts.startDate}T00:00:00Z`)
+        : undefined,
+      endDate: opts.endDate
+        ? new Date(`${opts.endDate}T23:59:59.999Z`)
+        : undefined,
+      maxScrolls: opts.maxScrolls,
+      onProgress: opts.onProgress,
+    });
+  } finally {
+    await lean.close().catch(() => {});
+  }
+}
+
 /**
  * Validate region parameter and return error response if invalid.
  */
@@ -661,7 +698,7 @@ const tools: Tool[] = [
   {
     name: "export_amazon_transactions_csv",
     description:
-      "Export Amazon payment transactions to CSV file. Extracts transaction data from each order's detail page. CSV columns include: date, order ID, amount, payment method, card info. For faster bulk transaction export, consider get_amazon_transactions which scrapes the dedicated transactions page.",
+      "Export Amazon payment transactions (card charges and refunds) to CSV file, from the dedicated payments page - the same rows get_amazon_transactions returns. CSV columns include: date, order ID, amount, payment method, card info. A window with no charges yields a header-only file.",
     inputSchema: {
       type: "object",
       properties: {
@@ -689,7 +726,12 @@ const tools: Tool[] = [
         },
         max_orders: {
           type: "number",
-          description: "Maximum number of orders to process",
+          description: "Maximum number of transaction rows to write",
+        },
+        max_scrolls: {
+          type: "number",
+          description:
+            "Maximum payments pages to walk (20 rows each). Default: 50. Increase for longer history.",
         },
       },
       required: ["region"],
@@ -1496,7 +1538,6 @@ async function runTool(request: any): Promise<any> {
         if (regionError) return regionError;
         const region = regionParam!;
 
-        const currentPage = await getPage();
         const year = args?.year as number | undefined;
         const startDate = args?.start_date as string | undefined;
         const endDate = args?.end_date as string | undefined;
@@ -1508,24 +1549,17 @@ async function runTool(request: any): Promise<any> {
           { year, startDate, endDate },
         );
 
-        const fetchResult = await fetchOrders(currentPage, amazonPlugin, {
-          region,
-          year,
-          startDate,
-          endDate,
-          includeItems: false,
-          includeShipments: false,
-          includeTransactions: true,
-          maxOrders,
+        // Read the payments page. Amazon no longer lists charges on order-detail pages,
+        // which is where this tool used to look - so it "succeeded" with 0 rows every time.
+        const walk = await scrapeTransactions(region, {
+          startDate: startDate ?? (year ? `${year}-01-01` : undefined),
+          endDate: endDate ?? (year ? `${year}-12-31` : undefined),
+          maxScrolls: args?.max_scrolls as number | undefined,
         });
-
-        const timeEstimate = estimateExtractionTime(fetchResult.orders.length, {
-          includeItems: false,
-          includeShipments: false,
-        });
+        const transactions = walk.transactions.slice(0, maxOrders ?? undefined);
 
         const exportResult = await exportTransactionsCSV(
-          fetchResult.transactions,
+          transactions,
           outputPath,
         );
 
@@ -1547,14 +1581,14 @@ async function runTool(request: any): Promise<any> {
                   filePath: exportResult.filePath,
                   rowCount: exportResult.rowCount,
                   error: exportResult.error,
-                  fetchErrors: fetchResult.errors,
-                  timing: {
-                    orderCount: fetchResult.orders.length,
-                    transactionCount: fetchResult.transactions.length,
-                    estimate: timeEstimate.formattedEstimate,
-                    warnings: timeEstimate.warnings,
-                    recommendations: timeEstimate.recommendations,
-                  },
+                  ...(walk.truncated
+                    ? { warning: TRUNCATED_WARNING }
+                    : exportResult.rowCount === 0
+                      ? {
+                          warning:
+                            "No charges in this window. If that is unexpected, widen max_scrolls - the payments page is walked newest-first.",
+                        }
+                      : {}),
                 },
                 null,
                 2,
@@ -1570,24 +1604,19 @@ async function runTool(request: any): Promise<any> {
         if (regionError) return regionError;
         const region = regionParam!;
 
-        const currentPage = await getPage();
         const progressToken = request.params._meta?.progressToken;
         const startDate = args?.start_date as string | undefined;
         const endDate = args?.end_date as string | undefined;
         const maxScrolls = args?.max_scrolls as number | undefined;
 
-        const transactions = await extractTransactionsFromPage(
-          currentPage,
-          region,
-          {
-            startDate: startDate ? new Date(startDate) : undefined,
-            endDate: endDate ? new Date(endDate) : undefined,
-            maxScrolls,
-            onProgress: async (message, count) => {
-              await sendProgress(progressToken, count, 0, message);
-            },
+        const { transactions, truncated } = await scrapeTransactions(region, {
+          startDate,
+          endDate,
+          maxScrolls,
+          onProgress: async (message, count) => {
+            await sendProgress(progressToken, count, 0, message);
           },
-        );
+        });
 
         return {
           content: [
@@ -1603,6 +1632,7 @@ async function runTool(request: any): Promise<any> {
                     maxScrolls,
                   },
                   transactionCount: transactions.length,
+                  ...(truncated ? { warning: TRUNCATED_WARNING } : {}),
                   transactions: transactions.map((t) => ({
                     date: t.date.toISOString(),
                     orderIds: t.orderIds,

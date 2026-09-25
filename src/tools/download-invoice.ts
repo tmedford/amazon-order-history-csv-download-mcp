@@ -89,7 +89,12 @@ export async function downloadAmazonInvoice(
   }
 
   try {
-    await page.waitForSelector(INVOICE_SELECTOR, { timeout: 5000 });
+    // "attached", not the default "visible": the invoice carries two chargeSummary blocks
+    // and the first is hidden, so waiting for visibility timed out on every invoice.
+    await page.waitForSelector(INVOICE_SELECTOR, {
+      state: "attached",
+      timeout: 5000,
+    });
   } catch (error) {
     return {
       success: false,
