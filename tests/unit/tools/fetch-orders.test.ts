@@ -95,6 +95,7 @@ describe("fetchOrders date range orchestration", () => {
 
     const result = await fetchOrders(page, plugin, {
       region: "us",
+      concurrency: 1,
       year: 1999,
       startDate: "2024-12-31",
       endDate: "2025-01-01",
@@ -126,6 +127,7 @@ describe("fetchOrders date range orchestration", () => {
 
     const result = await fetchOrders(page, plugin, {
       region: "us",
+      concurrency: 1,
       startDate: "2024-12-01",
       endDate: "2025-12-31",
       maxOrders: 2,
@@ -151,6 +153,7 @@ describe("fetchOrders date range orchestration", () => {
 
     const result = await fetchOrders(page, plugin, {
       region: "us",
+      concurrency: 1,
       startDate: `${startYear}-06-01`,
     });
 
@@ -172,6 +175,7 @@ describe("fetchOrders date range orchestration", () => {
 
     const result = await fetchOrders(page, plugin, {
       region: "us",
+      concurrency: 1,
       endDate: "2022-03-01",
     });
 
@@ -196,6 +200,7 @@ describe("fetchOrders date range orchestration", () => {
   ])("rejects $error before browser navigation", async ({ options, error }) => {
     const result = await fetchOrders(page, plugin, {
       region: "us",
+      concurrency: 1,
       ...options,
     });
 
@@ -213,6 +218,7 @@ describe("fetchOrders date range orchestration", () => {
 
     const result = await fetchOrders(page, plugin, {
       region: "us",
+      concurrency: 1,
       year: 2021,
     });
 

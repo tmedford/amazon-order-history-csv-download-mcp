@@ -96,13 +96,14 @@ export async function extractTransactionsFromPage(
     )
     .catch(() => {});
 
-  // Give initial content time to render
-  await page.waitForTimeout(1000);
-
   let allTransactions: Transaction[] = [];
   let pageCount = 0;
   let previousCount = 0;
   let stableCount = 0;
+  // How the current page was reached. Paginated pages never overlap, so their rows are
+  // appended as-is: two identical charges (same day, order and amount - e.g. a refund
+  // issued twice) are two real rows. Only the legacy infinite scroll re-shows rows.
+  let mode: "first" | "page" | "scroll" = "first";
 
   // The transactions page is paginated (Previous/Next page buttons).
   // Walk pages until there's no enabled Next button, we pass the start date,
@@ -111,8 +112,10 @@ export async function extractTransactionsFromPage(
     // Extract current transactions
     const pageTransactions = await extractVisibleTransactions(page, currency);
 
-    // Merge with existing (deduplicate)
-    allTransactions = mergeTransactions(allTransactions, pageTransactions);
+    allTransactions =
+      mode === "scroll"
+        ? mergeTransactions(allTransactions, pageTransactions)
+        : [...allTransactions, ...pageTransactions];
 
     onProgress?.(
       `Found ${allTransactions.length} transactions...`,
@@ -152,6 +155,7 @@ export async function extractTransactionsFromPage(
     if (!advanced) {
       break;
     }
+    mode = advanced;
     pageCount++;
   }
 
@@ -677,14 +681,14 @@ function parseTransactionText(
 
 /**
  * Advance to the next page of transactions.
- * Returns true if navigation happened, false if there is no next page.
+ * Returns "page" after a paginated Next, "scroll" after a legacy scroll, false at the end.
  *
  * The paginated page uses a form-submit button:
  *   <input name="ppw-widgetEvent:DefaultNextPageNavigationEvent:..." type="submit">
  * (disabled buttons have no such input / carry the disabled attribute).
  * Falls back to scrolling for legacy infinite-scroll layouts.
  */
-async function goToNextPage(page: Page): Promise<boolean> {
+async function goToNextPage(page: Page): Promise<"page" | "scroll" | false> {
   const nextButton = page.locator(
     'input[name*="DefaultNextPageNavigationEvent"]:not([disabled])',
   );
@@ -711,7 +715,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
         { rows: previousRows, selector: APX_TRANSACTION_SELECTOR },
         { timeout: APX_PAGE_TRANSITION_TIMEOUT_MS },
       );
-      return true;
+      return "page";
     } catch {
       return false;
     }
@@ -726,7 +730,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
   if (exists > 0) {
     await lastTransaction.scrollIntoViewIfNeeded().catch(() => {});
     await page.waitForTimeout(500);
-    return true;
+    return "scroll";
   }
 
   return false;
