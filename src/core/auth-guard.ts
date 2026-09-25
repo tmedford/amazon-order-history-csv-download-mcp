@@ -57,6 +57,8 @@ export const DEFAULT_AUTH_GUARD_OPTIONS: AuthGuardOptions = {
 
 export class AuthGuard {
   private trustedUntil = 0;
+  /** One check at a time: concurrent callers share it (they would race on the one page). */
+  private inFlight: Promise<EnsureResult> | null = null;
 
   constructor(
     private readonly deps: AuthGuardDeps,
@@ -68,10 +70,19 @@ export class AuthGuard {
     this.trustedUntil = 0;
   }
 
-  async ensure(): Promise<EnsureResult> {
+  ensure(): Promise<EnsureResult> {
     if (this.deps.now() < this.trustedUntil) {
-      return { ok: true, repaired: false, attempts: 0 };
+      return Promise.resolve({ ok: true, repaired: false, attempts: 0 });
     }
+    if (!this.inFlight) {
+      this.inFlight = this.run().finally(() => {
+        this.inFlight = null;
+      });
+    }
+    return this.inFlight;
+  }
+
+  private async run(): Promise<EnsureResult> {
     let status = await this.deps.check();
     let attempts = 0;
     // Always try at least ONE re-import, even when the page looks like a password demand:
@@ -125,6 +136,9 @@ export function looksEmpty(payload: unknown): boolean {
   if (!payload || typeof payload !== "object") return false;
   const p = payload as Record<string, unknown>;
   if (p.status !== "success") return false;
+  // a single-order payload is never "an empty list" - its transactions array is empty
+  // whenever include_transactions is false (the default)
+  if ("order" in p) return false;
   for (const k of COUNT_KEYS) {
     if (typeof p[k] === "number") return p[k] === 0;
   }

@@ -225,11 +225,23 @@ async function importSessionFromChrome(context: BrowserContext): Promise<number>
   return 0;
 }
 
+// One open at a time: two concurrent calls used to both run openBrowserContext(), one
+// launching and one attaching, leaving a lock owner that thought it was attached.
+let opening: Promise<BrowserContext> | null = null;
+
 async function getBrowserContext(): Promise<BrowserContext> {
-  if (!browserContext) {
-    browserContext = await openBrowserContext();
+  if (browserContext) return browserContext;
+  if (!opening) {
+    opening = openBrowserContext()
+      .then((ctx) => {
+        browserContext = ctx;
+        return ctx;
+      })
+      .finally(() => {
+        opening = null;
+      });
   }
-  return browserContext;
+  return opening;
 }
 
 /**

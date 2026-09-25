@@ -84,6 +84,15 @@ describe("AuthGuard", () => {
     expect(calls.check).toBe(3);
   });
 
+  test("concurrent ensure() calls share one check", async () => {
+    const { d, calls } = deps([OUT, IN]);
+    const g = new AuthGuard(d, opts);
+    const [a, b] = await Promise.all([g.ensure(), g.ensure()]);
+    expect(a).toEqual(b);
+    expect(calls.check).toBe(2); // one OUT + one IN, not four
+    expect(calls.reimport).toBe(1);
+  });
+
   test("a failed re-import does not crash the loop", async () => {
     const { d } = deps([OUT, IN]);
     d.reimport = async () => {
@@ -103,6 +112,8 @@ describe("looksEmpty", () => {
     expect(looksEmpty({ status: "success", transactionCount: 3 })).toBe(false);
     expect(looksEmpty({ status: "error", transactionCount: 0 })).toBe(false);
     expect(looksEmpty({ status: "success", order: { id: "x" } })).toBe(false);
+    // order details with include_transactions=false: empty transactions is not an empty list
+    expect(looksEmpty({ status: "success", order: { id: "x" }, transactions: [] })).toBe(false);
     expect(looksEmpty(null)).toBe(false);
   });
 });
