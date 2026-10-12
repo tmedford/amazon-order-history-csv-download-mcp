@@ -76,6 +76,48 @@ Once configured, you can ask your AI assistant:
 - "What's my Amazon gift card balance?"
 - "Show me all my Amazon transactions from last month"
 
+## Deployment (this fork)
+
+This repository is a fork of [marcusquinn/amazon-order-history-csv-download-mcp](https://github.com/marcusquinn/amazon-order-history-csv-download-mcp). The npm package `amz-order-history-csv-mcp` is published from the upstream repository, so `npx amz-order-history-csv-mcp` runs upstream's code, not this fork's. **This fork is run from a source checkout.**
+
+There is no hosted deployment. The server is a local **stdio** process: your MCP client starts `node dist/index.js` when a session opens and stops it when the session ends. On macOS it signs in from the Amazon cookies of the Chrome you are already signed in to, so it has to run on that machine.
+
+| What | Where |
+|---|---|
+| Code | the checkout you built (`dist/` is what runs; it is not committed) |
+| Registration | your MCP client's config, holding the absolute path to `dist/index.js` (Claude Code keeps it in `~/.claude.json`) |
+| State | `~/.amazon-order-history-mcp/browser-data`, the server's own browser profile (`AMAZON_ORDERS_BROWSER_DATA_DIR` overrides it) |
+| Exports | wherever each export tool is told to write, `~/Downloads` by default |
+
+**Install from this fork:**
+
+```bash
+git clone https://github.com/tmedford/amazon-order-history-csv-download-mcp.git
+cd amazon-order-history-csv-download-mcp
+npm ci && npm run build
+npx playwright install chromium   # the server drives Playwright's own Chromium
+claude mcp add amazon-orders -- node "$PWD/dist/index.js"
+```
+
+**Update**, then restart the client so it starts the new build:
+
+```bash
+git pull && npm ci && npm run build
+```
+
+**Move the checkout** and the registered path goes stale, because it is absolute. Re-register from the new location:
+
+```bash
+claude mcp remove amazon-orders
+claude mcp add amazon-orders -- node "$PWD/dist/index.js"
+```
+
+**Check it** after either: call `check_amazon_auth_status`. `authenticated: true` means the server started and has a signed-in Amazon session. If it is false, sign in to Amazon in Chrome, or run once with `AMAZON_ORDERS_HEADFUL=1` to sign in in a visible window.
+
+**Environment (all optional):** `AMAZON_ORDERS_BROWSER_DATA_DIR` (profile location), `AMAZON_ORDERS_HEADFUL=1` (show the browser window), `AMAZON_ORDERS_CONCURRENCY` (order pages fetched at once, 1-8).
+
+**Releases**: the release workflow inherited from upstream runs when `VERSION` changes on `main`; it creates a GitHub release and then attempts an npm publish, which is configured for upstream's package. Nothing here depends on it: a checkout at `main` is the deployed version.
+
 ## Supported Regions
 
 | Region         | Domain        | Currency |
